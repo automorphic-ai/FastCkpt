@@ -1,16 +1,28 @@
 from typing import List, Optional, Tuple
-from einops import rearrange
 
 import torch
-from torch import nn
-from torch.utils.checkpoint import _get_autocast_kwargs, check_backward_validity, get_device_states, set_device_states, detach_variable
-
 import transformers
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, BaseModelOutputWithPast
+from einops import rearrange
+from flash_attn.bert_padding import pad_input, unpad_input
+from flash_attn.flash_attn_interface import (
+    _flash_attn_varlen_backward,
+    _flash_attn_varlen_forward,
+)
+from torch import nn
+from torch.utils.checkpoint import (
+    _get_autocast_kwargs,
+    check_backward_validity,
+    detach_variable,
+    get_device_states,
+    set_device_states,
+)
+from transformers.utils import logging
+from transformers.models.llama.modeling_llama import (
+    BaseModelOutputWithPast,
+    apply_rotary_pos_emb,
+)
 
-from flash_attn.flash_attn_interface import _flash_attn_varlen_forward, _flash_attn_varlen_backward
-from flash_attn.bert_padding import unpad_input, pad_input
-
+logger = logging.get_logger("transformers")
 
 # define a global buffer to save flash attention outputs
 # it's called global because it saves the outputs for all layers
@@ -23,11 +35,13 @@ local_res_grad_buffer = None
 # hooks for the gradients of residual
 global_hooks = []
 
+
 def init_flash_attn_buffers(num_layers):
     # update the global buffer according to number of layers
     global global_flash_attn_out_buffer
     global_flash_attn_out_buffer = [None] * num_layers
-    
+
+
 def clean_hook():
     # Remove all hooks in the global buffer
     for hook in global_hooks:
@@ -35,44 +49,53 @@ def clean_hook():
     # Clear the global buffer
     global_hooks.clear()
 
+
 def clear_all_buffers_at_the_end_of_training():
-    # call it at the end of training 
+    # call it at the end of training
     global lobal_flash_attn_out_buffer
     global_flash_attn_out_buffer = None
     global local_res_grad_buffer
     local_res_grad_buffer = None
     clean_hook()
 
+
 def save_flash_attn_out_to_global_buffer(idx, out):
     global global_flash_attn_out_buffer
     global_flash_attn_out_buffer[idx] = out
+
 
 def get_flash_attn_out_from_global_buffer(idx):
     global global_flash_attn_out_buffer
     return global_flash_attn_out_buffer[idx]
 
+
 def free_flash_attn_out_buffer(idx):
     global global_flash_attn_out_buffer
     global_flash_attn_out_buffer[idx] = None
+
 
 def write_gradient_to_flash_attn_out(idx, grad):
     global global_flash_attn_out_buffer
     global_flash_attn_out_buffer[idx].grad = grad
 
+
 def save_res_grad_hook(grad):
     global local_res_grad_buffer
     local_res_grad_buffer = grad
 
+
 def load_and_add_res_grad_hook(grad):
     grad += get_res_grad_from_local_buffer()
+
 
 def get_res_grad_from_local_buffer():
     global local_res_grad_buffer
     assert local_res_grad_buffer is not None
     return local_res_grad_buffer
 
+
 class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
-    """ Avoid doing twice flash attention forward during checkpointed backward.
+    """Avoid doing twice flash attention forward during checkpointed backward.
     args:
         hidden_states,  # i.e., flash attention output which is saved in global buffer.
         attention_mask,
@@ -118,25 +141,40 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
 
         with torch.no_grad():
             # --- modules before flash attention ---
-            query_states, key_states, value_states, attention_mask, residual = run_function(*args)
-            
+            (
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                residual,
+            ) = run_function(*args)
+
             # --- prepare for flash attention ---
             bsz, q_len, _ = residual.size()
-            qkv = torch.stack([query_states, key_states, value_states], dim=2) # [bsz, nh, 3, q_len, hd]
-            qkv = qkv.transpose(1, 3) # [bsz, q_len, 3, nh, hd]
+            qkv = torch.stack(
+                [query_states, key_states, value_states], dim=2
+            )  # [bsz, nh, 3, q_len, hd]
+            qkv = qkv.transpose(1, 3)  # [bsz, q_len, 3, nh, hd]
 
             # unpad
             if attention_mask is None:
-                qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+                qkv = rearrange(qkv, "b s ... -> (b s) ...")
                 max_s = q_len
-                cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32,
-                                        device=qkv.device)
+                cu_q_lens = torch.arange(
+                    0,
+                    (bsz + 1) * q_len,
+                    step=q_len,
+                    dtype=torch.int32,
+                    device=qkv.device,
+                )
                 indices = None
             else:
                 nheads = qkv.shape[-2]
-                qkv = rearrange(qkv, 'b s three h d -> b s (three h d)')
+                qkv = rearrange(qkv, "b s three h d -> b s (three h d)")
                 qkv, indices, cu_q_lens, max_s = unpad_input(qkv, attention_mask)
-                qkv = rearrange(qkv, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
+                qkv = rearrange(
+                    qkv, "nnz (three h d) -> nnz three h d", three=3, h=nheads
+                )
 
             # --- compute flash attention ---
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -151,6 +189,7 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
                 0.0,
                 softmax_scale,
                 causal=True,
+                window_size=(-1, -1), # for sliding window local attention
                 return_softmax=False,
             )
 
@@ -158,7 +197,7 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
         save_flash_attn_out_to_global_buffer(ctx.layer_idx, out)
         tensor_inputs += [softmax_lse]
         ctx.softmax_scale = softmax_scale
-        
+
         ctx.save_for_backward(*tensor_inputs)
 
         return out, residual, indices
@@ -169,7 +208,8 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad() or when an `inputs` parameter"
                 " is passed to .backward(). Please use .backward() and do not pass its `inputs`"
-                " argument.")
+                " argument."
+            )
         # Copy the list to avoid modifying original list.
         inputs = list(ctx.inputs)
         tensor_indices = ctx.tensor_indices
@@ -180,7 +220,7 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
         # Fill the flash attention output first
         if ctx.layer_idx > 0:
             # inputs[0] should be flash attention output
-            inputs[0] = get_flash_attn_out_from_global_buffer(ctx.layer_idx-1)
+            inputs[0] = get_flash_attn_out_from_global_buffer(ctx.layer_idx - 1)
         for i, idx in enumerate(tensor_indices):
             inputs[idx] = tensors[i]
 
@@ -196,31 +236,46 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
                 if ctx.had_cuda_in_fwd:
                     set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
             detached_inputs = detach_variable(tuple(inputs))
-            with torch.enable_grad(), \
-                 torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs), \
-                 torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):
+            with torch.enable_grad(), torch.cuda.amp.autocast(
+                **ctx.gpu_autocast_kwargs
+            ), torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):
                 # Stop recomputation before flash attention
                 # It is unecessary to run recomputation for flash attn
-                query_states, key_states, value_states, attention_mask, residual = ctx.run_function(*detached_inputs)
+                (
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    residual,
+                ) = ctx.run_function(*detached_inputs)
 
                 # --- prepare for flash attention ---
                 bsz, q_len, _ = residual.size()
-                qkv = torch.stack([query_states, key_states, value_states], dim=2) # [bsz, nh, 3, q_len, hd]
-                qkv = qkv.transpose(1, 3) # [bsz, q_len, 3, nh, hd]
+                qkv = torch.stack(
+                    [query_states, key_states, value_states], dim=2
+                )  # [bsz, nh, 3, q_len, hd]
+                qkv = qkv.transpose(1, 3)  # [bsz, q_len, 3, nh, hd]
 
                 # unpad
                 if attention_mask is None:
-                    qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+                    qkv = rearrange(qkv, "b s ... -> (b s) ...")
                     max_s = q_len
-                    cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32,
-                                            device=qkv.device)
+                    cu_q_lens = torch.arange(
+                        0,
+                        (bsz + 1) * q_len,
+                        step=q_len,
+                        dtype=torch.int32,
+                        device=qkv.device,
+                    )
                     indices = None
                 else:
                     nheads = qkv.shape[-2]
-                    qkv = rearrange(qkv, 'b s three h d -> b s (three h d)')
+                    qkv = rearrange(qkv, "b s three h d -> b s (three h d)")
                     qkv, indices, cu_q_lens, max_s = unpad_input(qkv, attention_mask)
-                    qkv = rearrange(qkv, 'nnz (three h d) -> nnz three h d', three=3, h=nheads)
-        
+                    qkv = rearrange(
+                        qkv, "nnz (three h d) -> nnz three h d", three=3, h=nheads
+                    )
+
         # run backward() with only tensor that requires grad
         # run flash attention backward first:
         # get 'dout' from auto_grad inputs
@@ -250,6 +305,7 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
             0.0,
             ctx.softmax_scale,
             True,
+            window_size=(-1,-1), # for sliding window local attention
             rng_state=None,
         )
         dqkv = dqkv[..., : dout.shape[-1]]
@@ -257,23 +313,31 @@ class CheckpointFunctionEndWithFlashAttention(torch.autograd.Function):
         # run backward for the part before flash attention
         qkv.backward(dqkv)
 
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None
-                      for inp in detached_inputs)
-        
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None
+            for inp in detached_inputs
+        )
+
         # write flash attention output gradients to buffer
         if ctx.layer_idx > 0:
-            write_gradient_to_flash_attn_out(ctx.layer_idx-1, detached_inputs[0].grad)
+            write_gradient_to_flash_attn_out(ctx.layer_idx - 1, detached_inputs[0].grad)
 
         return (None, None, None) + grads
 
 
-def checkpoint_end_with_flash_attention(function, layer_idx, *args, use_reentrant: bool = True, **kwargs):
+def checkpoint_end_with_flash_attention(
+    function, layer_idx, *args, use_reentrant: bool = True, **kwargs
+):
     # Hack to mix *args with **kwargs in a python 2.7-compliant way
-    preserve = kwargs.pop('preserve_rng_state', True)
+    preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs and use_reentrant:
-        raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
+        raise ValueError(
+            "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
+        )
 
-    return CheckpointFunctionEndWithFlashAttention.apply(function, layer_idx, preserve, *args)
+    return CheckpointFunctionEndWithFlashAttention.apply(
+        function, layer_idx, preserve, *args
+    )
 
 
 class CheckpointFunctionLastModule(torch.autograd.Function):
@@ -306,7 +370,9 @@ class CheckpointFunctionLastModule(torch.autograd.Function):
         ctx.tensor_indices = []
         tensor_inputs = []
 
-        assert torch.is_tensor(args[0]), "assuming the first tensor is the flash attention output"
+        assert torch.is_tensor(
+            args[0]
+        ), "assuming the first tensor is the flash attention output"
         for i, arg in enumerate(args):
             if torch.is_tensor(arg) and i == 0:
                 # flash attn output has been saved to global buffer
@@ -330,7 +396,8 @@ class CheckpointFunctionLastModule(torch.autograd.Function):
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad() or when an `inputs` parameter"
                 " is passed to .backward(). Please use .backward() and do not pass its `inputs`"
-                " argument.")
+                " argument."
+            )
         # Copy the list to avoid modifying original list.
         inputs = list(ctx.inputs)
         tensor_indices = ctx.tensor_indices
@@ -355,9 +422,9 @@ class CheckpointFunctionLastModule(torch.autograd.Function):
                 if ctx.had_cuda_in_fwd:
                     set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
             detached_inputs = detach_variable(tuple(inputs))
-            with torch.enable_grad(), \
-                 torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs), \
-                 torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):
+            with torch.enable_grad(), torch.cuda.amp.autocast(
+                **ctx.gpu_autocast_kwargs
+            ), torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -373,20 +440,26 @@ class CheckpointFunctionLastModule(torch.autograd.Function):
         if len(outputs_with_grad) == 0:
             raise RuntimeError(
                 "none of output has requires_grad=True,"
-                " this checkpoint() is not necessary")
+                " this checkpoint() is not necessary"
+            )
         torch.autograd.backward(outputs_with_grad, args_with_grad)
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None
-                      for inp in detached_inputs)
-        
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None
+            for inp in detached_inputs
+        )
+
         # write flash attention output gradients to buffer
         write_gradient_to_flash_attn_out(-1, detached_inputs[0].grad)
 
         return (None, None) + grads
 
+
 def checkpoint_last_module(function, *args, use_reentrant: bool = True, **kwargs):
-    preserve = kwargs.pop('preserve_rng_state', True)
+    preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs and use_reentrant:
-        raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
+        raise ValueError(
+            "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
+        )
 
     return CheckpointFunctionLastModule.apply(function, preserve, *args)
 
@@ -423,7 +496,7 @@ def llama_layer_forward(
         residual = hidden_states
 
         if residual.requires_grad:
-            # register a hook to add the gradient of residual 
+            # register a hook to add the gradient of residual
             # from next checkpoint layer when doing recomputation
             hook = residual.register_hook(load_and_add_res_grad_hook)
             global_hooks.append(hook)
@@ -432,18 +505,32 @@ def llama_layer_forward(
 
         # Flash Attention
         bsz, q_len, _ = hidden_states.size()
-        query_states = self.self_attn.q_proj(hidden_states).view(bsz, q_len, self.self_attn.num_heads, self.self_attn.head_dim).transpose(1, 2)
-        key_states = self.self_attn.k_proj(hidden_states).view(bsz, q_len, self.self_attn.num_heads, self.self_attn.head_dim).transpose(1, 2)
-        value_states = self.self_attn.v_proj(hidden_states).view(bsz, q_len, self.self_attn.num_heads, self.self_attn.head_dim).transpose(1, 2)
+        query_states = (
+            self.self_attn.q_proj(hidden_states)
+            .view(bsz, q_len, self.self_attn.num_heads, self.self_attn.head_dim)
+            .transpose(1, 2)
+        )
+        key_states = (
+            self.self_attn.k_proj(hidden_states)
+            .view(bsz, q_len, self.self_attn.num_heads, self.self_attn.head_dim)
+            .transpose(1, 2)
+        )
+        value_states = (
+            self.self_attn.v_proj(hidden_states)
+            .view(bsz, q_len, self.self_attn.num_heads, self.self_attn.head_dim)
+            .transpose(1, 2)
+        )
 
         kv_seq_len = key_states.shape[-2]
         assert past_key_value is None, "past_key_value is not supported by fastckpt"
 
         cos, sin = self.self_attn.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
         # [bsz, nh, t, hd]
         assert not output_attentions, "output_attentions is not supported by fastckpt"
-        assert not use_cache, "use_cache is not supported by fastckpt"    
+        assert not use_cache, "use_cache is not supported by fastckpt"
         key_padding_mask = attention_mask
 
         return query_states, key_states, value_states, attention_mask, residual
@@ -452,10 +539,12 @@ def llama_layer_forward(
         # pad
         bsz, q_len, _ = residual.size()
         if attention_mask is None:
-            hidden_states = rearrange(hidden_states, '(b s) h d -> b s (h d)', b=bsz)
+            hidden_states = rearrange(hidden_states, "(b s) h d -> b s (h d)", b=bsz)
         else:
             assert indices is not None
-            hidden_states = pad_input(rearrange(hidden_states, 'nnz h d -> nnz (h d)'), indices, bsz, q_len)
+            hidden_states = pad_input(
+                rearrange(hidden_states, "nnz h d -> nnz (h d)"), indices, bsz, q_len
+            )
 
         hidden_states = self.self_attn.o_proj(hidden_states)
 
@@ -465,7 +554,7 @@ def llama_layer_forward(
             # collect the hooks which should be removed after backward to avoid memory leak
             hook = residual.register_hook(save_res_grad_hook)
             global_hooks.append(hook)
-        
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -496,23 +585,35 @@ def forward(
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
 ):
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_attentions = (
+        output_attentions
+        if output_attentions is not None
+        else self.config.output_attentions
+    )
     output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
     )
     use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    return_dict = (
+        return_dict if return_dict is not None else self.config.use_return_dict
+    )
 
     # retrieve input_ids and inputs_embeds
     if input_ids is not None and inputs_embeds is not None:
-        raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+        raise ValueError(
+            "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+        )
     elif input_ids is not None:
         batch_size, seq_length = input_ids.shape
     elif inputs_embeds is not None:
         batch_size, seq_length, _ = inputs_embeds.shape
     else:
-        raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        raise ValueError(
+            "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+        )
 
     seq_length_with_past = seq_length
     past_key_values_length = 0
@@ -524,7 +625,10 @@ def forward(
     if position_ids is None:
         device = input_ids.device if input_ids is not None else inputs_embeds.device
         position_ids = torch.arange(
-            past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            past_key_values_length,
+            seq_length + past_key_values_length,
+            dtype=torch.long,
+            device=device,
         )
         position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
     else:
@@ -537,9 +641,7 @@ def forward(
 
     if self.gradient_checkpointing and self.training:
         try:
-            logger.warning_once(
-                "***** Using fast gradient checkpointing... *****"
-            )
+            logger.warning_once("***** Using fast gradient checkpointing... *****")
         except:
             pass
         # initialize the global buffer
@@ -564,8 +666,10 @@ def forward(
         for idx in range(len(self.layers) + 1):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+            past_key_value = (
+                past_key_values[idx] if past_key_values is not None else None
+            )
 
             # HF gradient checkpointing checkpoints (hidden_states, attention_mask, position_ids)
             # We only checkpoints (hidden_states) as the others are shared across layers
@@ -575,25 +679,60 @@ def forward(
                     # hidden_states, attention_mask, position_ids, _ = inputs
                     hidden_states, _, _ = inputs
                     # None for past_key_value
-                    return module(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, compute_attn_only=True)
+                    return module(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        compute_attn_only=True,
+                    )
+
                 return custom_forward
-            
+
             def forward_ffn_attn_layer(module1, module2):
                 def custom_forward(*inputs):
                     hidden_states, residual, indices = inputs
                     # None for past_key_value
-                    layer_outputs = module1(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, compute_ffn_only=True, residual=residual, indices=indices)
+                    layer_outputs = module1(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        compute_ffn_only=True,
+                        residual=residual,
+                        indices=indices,
+                    )
                     hidden_states = layer_outputs[0]
-                    return module2(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, compute_attn_only=True)
+                    return module2(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        compute_attn_only=True,
+                    )
+
                 return custom_forward
-            
+
             def forward_last_ffn_module(module):
                 def custom_forward(*inputs):
                     hidden_states, residual, indices = inputs
                     # None for past_key_value
-                    return module(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, compute_ffn_only=True, residual=residual, indices=indices)
+                    return module(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        compute_ffn_only=True,
+                        residual=residual,
+                        indices=indices,
+                    )
+
                 return custom_forward
-            
+
             if idx == 0:
                 layer_outputs = checkpoint_end_with_flash_attention(
                     forward_first_attn_module(self.layers[0]),
@@ -613,7 +752,7 @@ def forward(
                 hidden_states = layer_outputs[0]
             else:
                 layer_outputs = checkpoint_end_with_flash_attention(
-                    forward_ffn_attn_layer(self.layers[idx-1], self.layers[idx]),
+                    forward_ffn_attn_layer(self.layers[idx - 1], self.layers[idx]),
                     idx,
                     hidden_states,
                     residual,
@@ -631,7 +770,9 @@ def forward(
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            past_key_value = (
+                past_key_values[idx] if past_key_values is not None else None
+            )
 
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -658,7 +799,11 @@ def forward(
 
     next_cache = next_decoder_cache if use_cache else None
     if not return_dict:
-        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        return tuple(
+            v
+            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+            if v is not None
+        )
     return BaseModelOutputWithPast(
         last_hidden_state=hidden_states,
         past_key_values=next_cache,
@@ -669,4 +814,6 @@ def forward(
 
 def replace_hf_ckpt_with_fast_ckpt():
     transformers.models.llama.modeling_llama.LlamaModel.forward = forward
-    transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = llama_layer_forward
+    transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = (
+        llama_layer_forward
+    )
